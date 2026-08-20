@@ -1,23 +1,23 @@
-# Retail Data Platform
+# Retail Sales ETL Pipeline
 
-A Python-based ETL pipeline that extracts retail sales data from CSV files, performs data transformation and quality validation using Pandas, and loads the processed data into PostgreSQL.
+A Python-based batch ETL pipeline that extracts retail sales data from CSV files, performs data transformation and quality validation using Pandas, and loads the processed data into PostgreSQL with idempotent, batched upserts.
 
 ## Project Overview
 
-This project demonstrates an end-to-end batch ETL pipeline for processing retail sales data.
+This project demonstrates an end-to-end batch ETL pipeline for processing retail sales data at realistic volume (50,000+ records).
 
 The pipeline:
 
 1. Extracts raw sales data from a CSV file.
 2. Transforms and validates the data using Python and Pandas.
-3. Loads the processed data into PostgreSQL.
-4. Uses logging and error handling to monitor pipeline execution.
-5. Handles duplicate orders using PostgreSQL upsert logic.
+3. Quarantines invalid records (with reasons logged) instead of failing the entire batch.
+4. Loads the processed data into PostgreSQL using batched upserts.
+5. Uses logging and error handling to monitor pipeline execution end-to-end.
 
 ## Architecture
 
 ```text
-CSV File
+CSV File (50k+ rows)
    |
    v
 extract.py
@@ -30,12 +30,17 @@ transform.py
    |
    |-- Calculate total amount
    |-- Convert order date
-   |-- Validate missing values
-   |-- Validate quantity and price
-   |-- Check duplicate order IDs
+   |-- Flag missing values
+   |-- Quarantine invalid quantity / price / duplicate order_id
+   |-- Write quarantined rows to data/processed/quarantined_rows.csv
+   |
+   v
+Clean DataFrame
    |
    v
 load.py
+   |
+   |-- Batched upsert (5,000 rows/batch) via SQLAlchemy
    |
    v
 PostgreSQL
@@ -52,6 +57,8 @@ sales table
 * SQLAlchemy
 * psycopg2
 * python-dotenv
+* Faker (synthetic test data generation)
+* pytest (unit testing)
 * Git / GitHub
 
 ## Project Structure
@@ -61,6 +68,8 @@ Retail-data-platform/
 |
 |-- config/
 |-- data/
+|   |-- processed/
+|   |   `-- quarantined_rows.csv   (generated at runtime)
 |   `-- raw/
 |       `-- sales_data.csv
 |
@@ -75,6 +84,9 @@ Retail-data-platform/
 |   `-- main.py
 |
 |-- tests/
+|   `-- test_transform.py
+|
+|-- generate_data.py
 |-- .gitignore
 |-- README.md
 `-- requirements.txt
@@ -93,12 +105,12 @@ The pipeline also logs the number of records extracted.
 Example:
 
 ```text
-Extracted 3 rows from CSV
+Extracted 50000 rows from CSV
 ```
 
 ### 2. Transform and Validate
 
-`transform.py` performs data transformation and quality checks.
+`transform.py` performs data transformation and **row-level quality validation with quarantining** — invalid rows are set aside rather than blocking the entire batch.
 
 #### Transformations
 
@@ -110,22 +122,24 @@ total_amount = quantity * price
 
 * Converts `order_date` into a datetime format.
 
-#### Data Quality Checks
+#### Data Quality Checks (quarantine, not hard failure)
 
-* Detects missing values.
-* Validates that quantity is greater than zero.
-* Validates that price is greater than zero.
-* Detects duplicate `order_id` values.
+* Missing values are detected and logged as warnings.
+* Rows with `quantity <= 0` are quarantined.
+* Rows with missing or non-positive `price` are quarantined.
+* Duplicate `order_id` values are quarantined (first occurrence kept).
+* Quarantined rows are written to `data/processed/quarantined_rows.csv` for audit.
+* If **all** rows fail validation, the pipeline raises an error and halts — treated as a structural data problem rather than a normal data quality issue.
 
-Validation failures for quantity, price, and duplicate order IDs stop the pipeline from loading invalid data, while missing values are logged as warnings.
+On a representative 50,000-row synthetic run: 2,267 rows were quarantined (1,036 invalid quantity, 506 missing price, 768 duplicate order IDs), while 47,733 valid rows proceeded to load.
 
 ### 3. Load
 
-`load.py` loads the transformed data into PostgreSQL using SQLAlchemy and psycopg2.
+`load.py` loads the transformed data into PostgreSQL using SQLAlchemy and psycopg2, in **batches of 5,000 rows**.
 
 The data is loaded into the `sales` table.
 
-The pipeline uses PostgreSQL `ON CONFLICT` logic on `order_id` to update an existing order instead of creating a duplicate record.
+The pipeline uses PostgreSQL `ON CONFLICT` logic on `order_id` to update an existing order instead of creating a duplicate record, making reruns idempotent.
 
 Database operations are executed inside a transaction using SQLAlchemy.
 
@@ -144,17 +158,23 @@ The `sales` table contains:
 | `price`        | Price per unit            |
 | `total_amount` | Calculated order amount   |
 
-## Sample Data
+## Synthetic Test Data
 
-The current sample dataset contains three retail transactions:
+`generate_data.py` generates a configurable volume of realistic synthetic sales records using Faker, with intentionally injected data quality issues (negative quantities, missing prices, duplicate order IDs) so the validation logic is exercised against realistic conditions rather than clean toy data.
 
-| Order ID | Product  | Quantity | Price | Total Amount |
-| -------: | -------- | -------: | ----: | -----------: |
-|     1001 | Laptop   |        1 | 75000 |        75000 |
-|     1002 | Mouse    |        2 |  1200 |         2400 |
-|     1003 | Keyboard |        1 |  2500 |         2500 |
+```bash
+python generate_data.py
+```
 
-Total sales value in the sample dataset: **INR 79,900**
+## Testing
+
+Unit tests cover the transformation and validation logic using `pytest`:
+
+```bash
+pytest tests/ -v
+```
+
+Current coverage includes: total amount calculation, quarantining of invalid quantity/price/duplicate rows, date conversion, and the all-rows-invalid failure case.
 
 ## How to Run
 
@@ -194,7 +214,13 @@ The `.env` file is excluded from Git using `.gitignore`.
 
 Create the `retail_pipeline` database and the required `sales` table.
 
-### 6. Run the pipeline
+### 6. (Optional) Generate synthetic data
+
+```powershell
+python generate_data.py
+```
+
+### 7. Run the pipeline
 
 From the project root:
 
@@ -203,13 +229,26 @@ cd src
 python main.py
 ```
 
+### 8. Run tests
+
+From the project root:
+
+```powershell
+pytest tests/ -v
+```
+
 ## Sample Pipeline Output
 
 ```text
 ETL pipeline started
-Extracted 3 rows from CSV
-Transformation and validation completed successfully
-Loaded 3 rows into PostgreSQL
+Extracted 50000 rows from CSV
+Dropping 1036 rows with invalid quantity (<= 0)
+Dropping 506 rows with invalid/missing price
+Dropping 768 duplicate order_id rows (keeping first occurrence)
+Quarantined 2267 of 50000 rows (47733 rows passed validation)
+Loaded batch 1: 5000 rows
+...
+Loaded 47733 rows into PostgreSQL
 ETL pipeline completed successfully
 ```
 
@@ -221,28 +260,27 @@ The pipeline includes:
 
 * Exception handling during extraction, transformation, and loading.
 * Informative logging for pipeline execution.
-* Data validation failures.
+* Row-level data quality quarantining with an auditable output file.
 * Database transaction handling.
-* PostgreSQL conflict handling for duplicate order IDs.
+* PostgreSQL conflict handling for duplicate order IDs, enabling idempotent reruns.
 
 ## Future Enhancements
 
 Planned improvements for future phases include:
 
-* Batch/bulk database loading for larger datasets.
 * Automated pipeline scheduling with Apache Airflow.
 * Docker containerization.
-* Cloud data warehouse integration.
-* Incremental data processing.
-* Additional automated data-quality tests.
-* Scalable processing using distributed data technologies.
+* Cloud data warehouse integration (Snowflake).
+* Incremental/streaming data processing.
+* Integration tests against a test database.
+* CI pipeline (GitHub Actions) running tests on every push.
 
 ## Project Status
 
-**Phase 1 - Completed**
+**Phase 1 - Completed and hardened**
 
 Current implementation:
 
-**CSV -> Python/Pandas ETL -> PostgreSQL**
+**CSV -> Python/Pandas ETL (quarantine-based validation) -> PostgreSQL (batched, idempotent upserts) -> pytest test suite**
 
 Future phases will focus on orchestration, containerization, scalability, and cloud integration.
