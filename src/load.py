@@ -8,9 +8,10 @@ load_dotenv()
 def load_data(df):
     try:
         password = os.getenv("DB_PASSWORD")
+        db_host = os.getenv("DB_HOST", "localhost")
 
         engine = create_engine(
-            f"postgresql+psycopg2://postgres:{password}@localhost:5432/retail_pipeline"
+            f"postgresql+psycopg2://postgres:{password}@{db_host}:5432/retail_pipeline"
         )
 
         records = df.to_dict(orient="records")

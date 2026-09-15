@@ -1,9 +1,11 @@
 import pandas as pd
 import logging
+import os
 
 
 def extract_data():
-    file_path = "../data/raw/sales_data.csv"
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    file_path = os.path.join(BASE_DIR, "data", "raw", "sales_data.csv")
 
     try:
         df = pd.read_csv(file_path)
